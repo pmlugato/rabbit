@@ -5,6 +5,7 @@ import tensorflow as tf
 tf.config.experimental.enable_op_determinism()
 
 import time
+import re
 
 import numpy as np
 from scipy.stats import chi2
@@ -18,6 +19,45 @@ from rabbit.tfhelpers import edmval_cov
 from wums import output_tools, logging  # isort: skip
 
 logger = None
+
+
+def _decode_param_name(param):
+    if hasattr(param, "decode"):
+        return param.decode()
+    return str(param)
+
+
+def _raise_with_hessian_context(exc, param_names, label):
+    message = str(exc)
+    cause = exc.__cause__
+    if cause is not None:
+        message = f"{message} ({cause})"
+
+    match = re.search(r"(\d+)-th leading minor", message)
+    if not match:
+        raise exc
+
+    minor = int(match.group(1))
+    decoded = [_decode_param_name(param) for param in param_names]
+    if minor < 1 or minor > len(decoded):
+        raise ValueError(
+            f"{message}. The failing leading minor index {minor} is outside the {label} "
+            f"parameter list of length {len(decoded)}."
+        ) from exc
+
+    idx = minor - 1
+    lo = max(0, idx - 2)
+    hi = min(len(decoded), idx + 3)
+    nearby = ", ".join(
+        f"[{i}] {decoded[i]}" for i in range(lo, hi)
+    )
+
+    raise ValueError(
+        f"{message}. In the current {label} parameter ordering this first failing leading "
+        f"minor maps to parameter [{idx}] '{decoded[idx]}'. Nearby parameters: {nearby}. "
+        "This identifies where Cholesky first fails in the current ordering; the underlying "
+        "issue can still come from a correlated block rather than one parameter alone."
+    ) from exc
 
 
 def make_parser():
@@ -299,7 +339,10 @@ def fit(args, fitter, ws, dofit=True):
         # compute the covariance matrix and estimated distance to minimum
 
         val, grad, hess = fitter.loss_val_grad_hess()
-        edmval, cov = edmval_cov(grad, hess)
+        try:
+            edmval, cov = edmval_cov(grad, hess)
+        except ValueError as exc:
+            _raise_with_hessian_context(exc, fitter.parms, "explicit fit")
         logger.info(f"edmval: {edmval}")
 
         fitter.cov.assign(cov)
@@ -312,7 +355,11 @@ def fit(args, fitter, ws, dofit=True):
             # It should be near-zero by construction as long as the analytic profiling is
             # correct
             _, gradbeta, hessbeta = fitter.loss_val_grad_hess_beta()
-            edmvalbeta, covbeta = edmval_cov(gradbeta, hessbeta)
+            beta_param_names = [f"beta[{i}]" for i in range(int(hessbeta.shape[0]))]
+            try:
+                edmvalbeta, covbeta = edmval_cov(gradbeta, hessbeta)
+            except ValueError as exc:
+                _raise_with_hessian_context(exc, beta_param_names, "profiled beta")
             logger.info(f"edmvalbeta: {edmvalbeta}")
 
         if args.doImpacts:

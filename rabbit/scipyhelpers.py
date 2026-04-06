@@ -34,10 +34,10 @@ def scipy_edmval_cov(grad, hess):
     # FIXME catch this exception to mark failed toys and continue
     try:
         chol = cho_factor_clean(hess, lower=False)
-    except scipy.linalg.LinAlgError:
+    except scipy.linalg.LinAlgError as exc:
         raise ValueError(
             "Cholesky decomposition failed, Hessian is not positive-definite"
-        )
+        ) from exc
 
     gradv = grad[..., None]
     edmval = 0.5 * gradv.T @ scipy.linalg.cho_solve(chol, gradv)
