@@ -800,6 +800,539 @@ class AxisExpModel(ParamModel):
         return tf.concat(rnorms, axis=0)
 
 
+class AxisExpQuadModel(ParamModel):
+    """
+    Per-(process, cell) exponential-quadratic background param model.
+
+    The one-parameter-per-cell extension of AxisExpModel::
+
+        rnorm = exp(lnAmpl_c + slope_s · u_m + curv_q · q_m)
+
+    with u_m = x_m - 1/2 and q_m = u_m^2 - <u^2>, i.e. the first three orthogonal
+    polynomials on the window
+
+    where x_m is the normalized centre of shape-axis bin m in [0, 1], so u_m runs
+    over [-1/2, +1/2].  Three independent groupings, each a subset of the cell
+    axes: lnAmpl over cell_axes, slope over slope_axes, curv over curv_axes.  A
+    coarser grouping for the shape than for the amplitude is the normal case --
+    every cell needs its own rate, but a curvature that is a property of the
+    background's kinematics is shared, and sharing it is what keeps the parameter
+    count from tracking the cell count.
+
+    **Orthogonalised on purpose, against the constant as well as the linear.**
+    exp(a + b x + c x^2) spans exactly the same functions, so the optimum is
+    indifferent to the basis and the Hessian is not.  Over a uniform grid x and
+    x^2 have correlation 0.97, which centring to u removes.  Centring alone is
+    not enough: <u^2> = 1/12 is nonzero, so a free constant explains 55.6% of the
+    quadratic's variance -- and lnAmpl IS a free constant, one per cell.  That
+    near-degeneracy stalls the minimiser on data (identical loss for 8000
+    iterations, then a Hessian that is not positive-definite) while leaving the
+    Asimov fit's perfect closure untouched, because Asimov sits at the truth where
+    the flat direction costs nothing.  Subtracting the mean makes q_m orthogonal
+    to both, which is the second Legendre polynomial on the window.
+
+    The mean is taken over the actual bin centres rather than assumed to be 1/12,
+    so a non-uniform shape axis is orthogonalised correctly too.
+
+    Note the consequence: exp(lnAmpl) is the yield at the window *centre* here,
+    where in AxisExpModel it is the yield at the low edge.
+
+    All three parameters are unconstrained reals -- exp() of anything real is
+    positive, so there is no boundary, no softplus, and no c -> 0 degeneracy of
+    the kind a coefficient-positivity constraint introduces.  curv = 0 is an
+    interior point, so the model nests AxisExpModel at a non-degenerate Hessian
+    and the chi-square difference is a likelihood ratio for one parameter.
+
+    Usage::
+
+        --paramModel AxisExpQuadModel <channel> <proc_spec> <shape_axis> \
+            <cell_axes>[ <slope_axes>[ <curv_axes>]]
+
+    Example -- per-cell rate, slope shared across eta, one global curvature::
+
+        --paramModel AxisExpQuadModel btojpsik_cvhnano BuJpsiKBkg \
+            jointCvh_mass \
+            fit_bachelor_pt,fit_bachelor_eta,fit_bachelor_charge \
+            fit_bachelor_eta \
+            fit_bachelor_eta
+    """
+
+    @classmethod
+    def parse_args(cls, indata, *args, **kwargs):
+        if len(args) not in (4, 5, 6):
+            raise ValueError(
+                f"AxisExpQuadModel requires 4 to 6 positional arguments "
+                f"(channel, proc_spec, shape_axis, cell_axes[, slope_axes"
+                f"[, curv_axes]]) but got {len(args)}: {args}"
+            )
+        channel, proc_spec, shape_axis, cell_axes_csv = args[:4]
+        return cls(
+            indata,
+            channel,
+            proc_spec,
+            shape_axis,
+            cell_axes_csv,
+            slope_axes_csv=args[4] if len(args) >= 5 else None,
+            curv_axes_csv=args[5] if len(args) >= 6 else None,
+            **kwargs,
+        )
+
+    def __init__(
+        self,
+        indata,
+        channel,
+        proc_spec,
+        shape_axis,
+        cell_axes_csv,
+        slope_axes_csv=None,
+        curv_axes_csv=None,
+        expectSignal=None,
+        allowNegativeParam=False,
+        **kwargs,
+    ):
+        self.indata = indata
+
+        if channel not in indata.channel_info:
+            raise ValueError(
+                f"Channel '{channel}' not found in tensor. "
+                f"Available: {list(indata.channel_info.keys())}"
+            )
+        self.channel = channel
+        channel_axes = indata.channel_info[channel]["axes"]
+        axis_by_name = {a.name: a for a in channel_axes}
+
+        if shape_axis not in axis_by_name:
+            raise ValueError(
+                f"Shape axis '{shape_axis}' not found in channel '{channel}'. "
+                f"Available: {list(axis_by_name.keys())}"
+            )
+
+        cell_names = [n.strip() for n in cell_axes_csv.split(",")]
+        for name in cell_names:
+            if name not in axis_by_name:
+                raise ValueError(
+                    f"Cell axis '{name}' not found in channel '{channel}'. "
+                    f"Available: {list(axis_by_name.keys())}"
+                )
+            if name == shape_axis:
+                raise ValueError(
+                    f"Axis '{name}' appears in both shape_axis and cell_axes."
+                )
+        self.cell_axis_names = set(cell_names)
+        self.cell_axes = [axis_by_name[n] for n in cell_names]
+        self.shape_axis = shape_axis
+
+        def subset(csv, label):
+            """A shape grouping: subset of the cell axes, default all of them."""
+            if csv is None:
+                names = cell_names
+            else:
+                names = [n.strip() for n in csv.split(",")]
+                bad = [n for n in names if n not in self.cell_axis_names]
+                if bad:
+                    raise ValueError(
+                        f"{label} axes {bad} are not in cell_axes "
+                        f"'{cell_axes_csv}'. {label} axes must be a subset of "
+                        f"cell_axes."
+                    )
+            return names, set(names), [axis_by_name[n] for n in names]
+
+        slope_names, self.slope_axis_names, self.slope_axes = subset(
+            slope_axes_csv, "Slope"
+        )
+        curv_names, self.curv_axis_names, self.curv_axes = subset(
+            curv_axes_csv, "Curvature"
+        )
+        slope_shape = [a.size for a in self.slope_axes]
+        curv_shape = [a.size for a in self.curv_axes]
+        self.n_slope_groups = int(np.prod(slope_shape))
+        self.n_curv_groups = int(np.prod(curv_shape))
+
+        if proc_spec == "all":
+            target_encoded = list(indata.procs)
+        else:
+            target_encoded = []
+            for name in [p.strip() for p in proc_spec.split(",")]:
+                encoded = name.encode() if isinstance(name, str) else name
+                if encoded not in indata.procs:
+                    raise ValueError(
+                        f"Process '{name}' not found in tensor. "
+                        f"Available: {[p.decode() if isinstance(p, bytes) else p for p in indata.procs]}"
+                    )
+                target_encoded.append(encoded)
+        self.proc_idxs = [
+            int(np.where(indata.procs == p)[0][0]) for p in target_encoded
+        ]
+
+        cell_shape = [a.size for a in self.cell_axes]
+        self.n_cell = int(np.prod(cell_shape))
+        self.stride = self.n_cell + self.n_slope_groups + self.n_curv_groups
+        self.npoi = len(self.proc_idxs) * self.stride
+
+        names = []
+        for proc_encoded in target_encoded:
+            proc_name = (
+                proc_encoded.decode()
+                if isinstance(proc_encoded, bytes)
+                else str(proc_encoded)
+            )
+            for prefix, axes, shape in (
+                ("lnAmpl", self.cell_axes, cell_shape),
+                ("slope", self.slope_axes, slope_shape),
+                ("curv", self.curv_axes, curv_shape),
+            ):
+                for idxs in itertools.product(*[range(s) for s in shape]):
+                    label = "_".join(f"{a.name}{i}" for a, i in zip(axes, idxs))
+                    names.append(f"{prefix}_{proc_name}_{label}".encode())
+        self.params = np.array(names)
+
+        # Centred, normalized shape-axis bin centres: u in [-1/2, +1/2], and the
+        # quadratic with its mean removed so it is orthogonal to lnAmpl as well
+        # as to slope.
+        centers = np.asarray(axis_by_name[shape_axis].centers, dtype=np.float32)
+        span = max(float(centers[-1] - centers[0]), 1e-6)
+        u_m = (centers - centers[0]) / span - 0.5
+        q_m = u_m * u_m - float(np.mean(u_m * u_m))
+        self.u_m = tf.constant(u_m, dtype=indata.dtype)
+        self.q_m = tf.constant(q_m, dtype=indata.dtype)
+
+        full_shape = [a.size for a in channel_axes]
+        self.full_shape = full_shape
+        self.cell_reshape = [
+            a.size if a.name in self.cell_axis_names else 1 for a in channel_axes
+        ]
+        self.slope_cell_reshape = [
+            a.size if a.name in self.slope_axis_names else 1 for a in channel_axes
+        ]
+        self.curv_cell_reshape = [
+            a.size if a.name in self.curv_axis_names else 1 for a in channel_axes
+        ]
+        self.shape_reshape = [
+            a.size if a.name == shape_axis else 1 for a in channel_axes
+        ]
+
+        self.npou = 0
+        self.allowNegativeParam = True
+        self.is_linear = False
+        # lnAmpl=0 -> amplitude 1; slope=curv=0 -> flat.  Same starting point as
+        # AxisExpModel, so a fit can be seeded from one and compared to the other.
+        self.xparamdefault = tf.zeros([self.npoi], dtype=indata.dtype)
+
+    def compute(self, param, full=False):
+        u_reshaped = tf.reshape(self.u_m, self.shape_reshape)
+        q_reshaped = tf.reshape(self.q_m, self.shape_reshape)
+
+        rnorms = []
+        for k, v in self.indata.channel_info.items():
+            if v["masked"] and not full:
+                continue
+            nbins_channel = int(np.prod([a.size for a in v["axes"]]))
+            irnorm = tf.ones(
+                [nbins_channel, self.indata.nproc], dtype=self.indata.dtype
+            )
+            if k == self.channel:
+                for i, proc_idx in enumerate(self.proc_idxs):
+                    off = i * self.stride
+                    a_poi = param[off : off + self.n_cell]
+                    b_poi = param[
+                        off + self.n_cell : off + self.n_cell + self.n_slope_groups
+                    ]
+                    c_poi = param[
+                        off + self.n_cell + self.n_slope_groups : off + self.stride
+                    ]
+                    a = tf.reshape(a_poi, self.cell_reshape)
+                    b = tf.reshape(b_poi, self.slope_cell_reshape)
+                    c = tf.reshape(c_poi, self.curv_cell_reshape)
+                    scaling = tf.reshape(
+                        tf.broadcast_to(
+                            tf.exp(a + b * u_reshaped + c * q_reshaped),
+                            self.full_shape,
+                        ),
+                        [-1, 1],
+                    )
+                    proc_col = tf.one_hot(
+                        proc_idx, self.indata.nproc, dtype=self.indata.dtype
+                    )
+                    irnorm = irnorm + (scaling - 1.0) * tf.reshape(proc_col, [1, -1])
+            rnorms.append(irnorm)
+
+        return tf.concat(rnorms, axis=0)
+
+
+class AxisExpPolyModel(ParamModel):
+    """
+    Per-(process, cell) exponential-polynomial background param model, general
+    order.
+
+        rnorm = exp(lnAmpl_c + sum_{k=1..N} c_k,g_k * P_k(t))
+
+    with t the shape-axis bin centre mapped affinely onto [-1, 1] and P_k the
+    Legendre polynomials.  Order N = 1 is AxisExpModel (a slope), N = 2 is
+    AxisExpQuadModel, and higher orders add a genuinely new direction each.
+
+    **Why Legendre.**  Any polynomial basis of the same degree spans the same
+    functions, so the fitted optimum cannot tell them apart -- but the Hessian
+    can, and a fit that stalls on a near-flat direction is the failure this basis
+    is chosen to avoid.  Over a uniform grid the Legendre polynomials are mutually
+    orthogonal AND, for k >= 1, orthogonal to the constant.  The constant matters
+    because lnAmpl *is* a free constant, one per cell: with the naive basis
+    {x, x^2} a free constant explains 55.6% of the quadratic's variance, and with
+    {u, u^2} centred it still explains that much, since <u^2> = 1/12 != 0.  Only
+    subtracting the mean -- which is what P_2 does -- removes it.
+
+    Grouping: lnAmpl over cell_axes, and each polynomial order over its own
+    subset of the cell axes given as a comma-separated list per order.  A coarser
+    grouping for shape than for amplitude is the normal case: every cell needs its
+    own rate, but a shape that is a property of the background's kinematics is
+    shared, and sharing it is what keeps the parameter count from tracking the
+    cell count.
+
+    All parameters are unconstrained reals -- exp() of anything real is positive,
+    so there is no boundary, no softplus, and no coefficient-positivity
+    degeneracy.  All zeros is a flat unit background, and every order nests the
+    one below it at an interior point, so a chi-square difference between adjacent
+    orders is a likelihood ratio for one parameter.
+
+    Usage::
+
+        --paramModel AxisExpPolyModel <channel> <proc_spec> <shape_axis> \
+            <cell_axes> <order> [<axes_for_order_1>[ <axes_for_order_2> ...]]
+
+    Example -- per-cell rate, order 2, both orders shared across eta::
+
+        --paramModel AxisExpPolyModel btojpsik_cvhnano BuJpsiKBkg jointCvh_mass \
+            fit_bachelor_pt,fit_bachelor_eta,fit_bachelor_charge 2 \
+            fit_bachelor_eta fit_bachelor_eta
+    """
+
+    @classmethod
+    def parse_args(cls, indata, *args, **kwargs):
+        if len(args) < 5:
+            raise ValueError(
+                f"AxisExpPolyModel requires at least 5 positional arguments "
+                f"(channel, proc_spec, shape_axis, cell_axes, order) but got "
+                f"{len(args)}: {args}"
+            )
+        channel, proc_spec, shape_axis, cell_axes_csv, order = args[:5]
+        return cls(
+            indata,
+            channel,
+            proc_spec,
+            shape_axis,
+            cell_axes_csv,
+            int(order),
+            order_axes_csv=list(args[5:]) or None,
+            **kwargs,
+        )
+
+    def __init__(
+        self,
+        indata,
+        channel,
+        proc_spec,
+        shape_axis,
+        cell_axes_csv,
+        order,
+        order_axes_csv=None,
+        expectSignal=None,
+        allowNegativeParam=False,
+        **kwargs,
+    ):
+        self.indata = indata
+        if order < 1:
+            raise ValueError(f"AxisExpPolyModel order must be >= 1, got {order}")
+        self.order = int(order)
+
+        if channel not in indata.channel_info:
+            raise ValueError(
+                f"Channel '{channel}' not found in tensor. "
+                f"Available: {list(indata.channel_info.keys())}"
+            )
+        self.channel = channel
+        channel_axes = indata.channel_info[channel]["axes"]
+        axis_by_name = {a.name: a for a in channel_axes}
+
+        if shape_axis not in axis_by_name:
+            raise ValueError(
+                f"Shape axis '{shape_axis}' not found in channel '{channel}'. "
+                f"Available: {list(axis_by_name.keys())}"
+            )
+
+        cell_names = [n.strip() for n in cell_axes_csv.split(",")]
+        for name in cell_names:
+            if name not in axis_by_name:
+                raise ValueError(
+                    f"Cell axis '{name}' not found in channel '{channel}'. "
+                    f"Available: {list(axis_by_name.keys())}"
+                )
+            if name == shape_axis:
+                raise ValueError(
+                    f"Axis '{name}' appears in both shape_axis and cell_axes."
+                )
+        self.cell_axis_names = set(cell_names)
+        self.cell_axes = [axis_by_name[n] for n in cell_names]
+        self.shape_axis = shape_axis
+
+        # One grouping per polynomial order. Fewer given than the order means the
+        # remaining orders reuse the last one, which is the common case (all
+        # shape parameters share a grouping) written the short way.
+        if order_axes_csv is None:
+            order_axes_csv = [cell_axes_csv]
+        groupings = []
+        for k in range(self.order):
+            csv = order_axes_csv[min(k, len(order_axes_csv) - 1)]
+            names = [n.strip() for n in csv.split(",")]
+            bad = [n for n in names if n not in self.cell_axis_names]
+            if bad:
+                raise ValueError(
+                    f"Order-{k+1} axes {bad} are not in cell_axes "
+                    f"'{cell_axes_csv}'. They must be a subset of cell_axes."
+                )
+            groupings.append(names)
+        self.order_axis_names = [set(g) for g in groupings]
+        self.order_axes = [[axis_by_name[n] for n in g] for g in groupings]
+        self.n_order_groups = [
+            int(np.prod([a.size for a in axes])) for axes in self.order_axes
+        ]
+
+        if proc_spec == "all":
+            target_encoded = list(indata.procs)
+        else:
+            target_encoded = []
+            for name in [p.strip() for p in proc_spec.split(",")]:
+                encoded = name.encode() if isinstance(name, str) else name
+                if encoded not in indata.procs:
+                    raise ValueError(
+                        f"Process '{name}' not found in tensor. "
+                        f"Available: {[p.decode() if isinstance(p, bytes) else p for p in indata.procs]}"
+                    )
+                target_encoded.append(encoded)
+        self.proc_idxs = [
+            int(np.where(indata.procs == p)[0][0]) for p in target_encoded
+        ]
+
+        cell_shape = [a.size for a in self.cell_axes]
+        self.n_cell = int(np.prod(cell_shape))
+        self.stride = self.n_cell + sum(self.n_order_groups)
+        self.npoi = len(self.proc_idxs) * self.stride
+
+        names = []
+        for proc_encoded in target_encoded:
+            proc_name = (
+                proc_encoded.decode()
+                if isinstance(proc_encoded, bytes)
+                else str(proc_encoded)
+            )
+            for idxs in itertools.product(*[range(s) for s in cell_shape]):
+                label = "_".join(f"{a.name}{i}" for a, i in zip(self.cell_axes, idxs))
+                names.append(f"lnAmpl_{proc_name}_{label}".encode())
+            for k in range(self.order):
+                axes = self.order_axes[k]
+                shp = [a.size for a in axes]
+                for idxs in itertools.product(*[range(s) for s in shp]):
+                    label = "_".join(f"{a.name}{i}" for a, i in zip(axes, idxs))
+                    names.append(f"poly{k+1}_{proc_name}_{label}".encode())
+        self.params = np.array(names)
+
+        # The basis, orthogonalised ON THE ACTUAL GRID rather than nominally.
+        #
+        # Nominal Legendre polynomials are orthogonal as integrals over [-1, 1],
+        # which is not the same as orthogonal over 80 bin centres. Anchoring t at
+        # the first and last bin CENTRE (so both sit exactly at +/-1) leaves
+        # <P_2, 1> = +1.3e-2 and mutual correlations up to 8e-2 -- and it is
+        # exactly the overlap with the constant that stalls the fit, because
+        # lnAmpl is a free constant per cell.
+        #
+        # So: map with the axis EDGES, which puts every centre strictly inside
+        # (-1, 1), then run modified Gram-Schmidt against the constant and against
+        # each lower order. The result is exactly orthogonal on the real grid for
+        # any binning, uniform or not, and spans the same polynomials -- it is the
+        # discrete Legendre basis. Each column is normalised to unit rms so the
+        # coefficients are comparably scaled and the Hessian is well conditioned.
+        centers = np.asarray(axis_by_name[shape_axis].centers, dtype=np.float64)
+        edges = np.asarray(axis_by_name[shape_axis].edges, dtype=np.float64)
+        lo, hi = float(edges[0]), float(edges[-1])
+        span = max(hi - lo, 1e-6)
+        t = 2.0 * (centers - lo) / span - 1.0
+
+        basis = []
+        for k in range(1, self.order + 1):
+            v = t.astype(np.float64) ** k
+            v = v - v.mean()                       # orthogonal to the constant
+            for u in basis:                        # and to every lower order
+                v = v - (v @ u) / (u @ u) * u
+            nrm = float(np.sqrt(np.mean(v * v)))
+            if nrm < 1e-12:
+                raise ValueError(
+                    f"Order {k} is degenerate on this shape axis "
+                    f"({len(centers)} bins): the basis collapsed. Lower the order."
+                )
+            basis.append(v / nrm)
+        self.p_k = [tf.constant(v, dtype=indata.dtype) for v in basis]
+
+        # Recorded so a caller can assert the property rather than trust it.
+        self.basis_max_overlap = max(
+            [abs(float(v.mean())) for v in basis]
+            + [
+                abs(float(basis[i] @ basis[j]) / len(t))
+                for i in range(len(basis))
+                for j in range(i + 1, len(basis))
+            ]
+            or [0.0]
+        )
+
+        full_shape = [a.size for a in channel_axes]
+        self.full_shape = full_shape
+        self.cell_reshape = [
+            a.size if a.name in self.cell_axis_names else 1 for a in channel_axes
+        ]
+        self.order_reshape = [
+            [a.size if a.name in self.order_axis_names[k] else 1 for a in channel_axes]
+            for k in range(self.order)
+        ]
+        self.shape_reshape = [
+            a.size if a.name == shape_axis else 1 for a in channel_axes
+        ]
+
+        self.npou = 0
+        self.allowNegativeParam = True
+        self.is_linear = False
+        self.xparamdefault = tf.zeros([self.npoi], dtype=indata.dtype)
+
+    def compute(self, param, full=False):
+        p_reshaped = [
+            tf.reshape(self.p_k[k], self.shape_reshape) for k in range(self.order)
+        ]
+        rnorms = []
+        for key, v in self.indata.channel_info.items():
+            if v["masked"] and not full:
+                continue
+            nbins_channel = int(np.prod([a.size for a in v["axes"]]))
+            irnorm = tf.ones(
+                [nbins_channel, self.indata.nproc], dtype=self.indata.dtype
+            )
+            if key == self.channel:
+                for i, proc_idx in enumerate(self.proc_idxs):
+                    off = i * self.stride
+                    a = tf.reshape(param[off : off + self.n_cell], self.cell_reshape)
+                    expo = a
+                    pos = off + self.n_cell
+                    for k in range(self.order):
+                        n = self.n_order_groups[k]
+                        ck = tf.reshape(param[pos : pos + n], self.order_reshape[k])
+                        expo = expo + ck * p_reshaped[k]
+                        pos += n
+                    scaling = tf.reshape(
+                        tf.broadcast_to(tf.exp(expo), self.full_shape), [-1, 1]
+                    )
+                    proc_col = tf.one_hot(
+                        proc_idx, self.indata.nproc, dtype=self.indata.dtype
+                    )
+                    irnorm = irnorm + (scaling - 1.0) * tf.reshape(proc_col, [1, -1])
+            rnorms.append(irnorm)
+        return tf.concat(rnorms, axis=0)
+
+
 class AxisBernsteinModel(ParamModel):
     """
     Per-(process, cell) first-order Bernstein background param model.
